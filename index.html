@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>G+</title>
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#141414">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="apple-touch-icon" href="icon-192.png">
+<style>
+:root{--bg:#141414;--sf:#1f1f1f;--ln:#333;--tx:#efe8de;--mu:#9a9288;--am:#c2570c;--ok:#7fb87f;--er:#e0605a;color-scheme:dark;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+html,body{margin:0;background:var(--bg);color:var(--tx);font:16px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+*{box-sizing:border-box}.wrap{max-width:460px;margin:0 auto;padding:20px 16px 40px}
+h1{font-size:22px;margin:0 0 4px}h2{font-size:18px;margin:0 0 12px}.mu{color:var(--mu);font-size:14px}.logo{color:var(--am);font-weight:800}
+label{display:block;margin:14px 0 6px;font-size:14px;color:var(--mu)}
+input,select,textarea{width:100%;padding:12px;background:var(--sf);color:var(--tx);border:1px solid var(--ln);border-radius:8px;font:inherit}
+button{width:100%;padding:14px;margin-top:14px;background:var(--am);color:#fff;border:0;border-radius:8px;font:inherit;font-weight:700}
+button.ghost{background:var(--sf);border:1px solid var(--ln);color:var(--tx)}
+.card{background:var(--sf);border:1px solid var(--ln);border-radius:10px;padding:12px;margin-top:10px}
+.row{display:flex;justify-content:space-between;gap:8px;align-items:center}.row select{width:120px}
+.err{color:var(--er);margin-top:10px;font-size:14px}.ok{color:var(--ok);margin-top:10px;font-size:14px}
+.pill{display:inline-block;padding:2px 8px;border-radius:99px;border:1px solid var(--ln);font-size:12px}
+textarea{height:110px;font-size:12px}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+.top button{width:auto;margin:0;padding:8px 12px}
+</style></head><body><div class="wrap" id="app"></div>
+<script>
+// ---- Demo data. Replace with the Users and Apartments sheets (same roles and apartment_ids) ----
+const SYNC_URL='';              // Apps Script endpoint: sends the one time code, checks it, receives uploads
+const DEMO_CODE='123456';       // demo only; real code arrives by email
+const USERS=[
+ {id:'USR-0001',name:'Kevin Ndemo',role:'admin',email:'admin@demo',phone:'0700000001',apts:[],pin:'1234'},
+ {id:'USR-0003',name:'Otieno Odhiambo',role:'caretaker',email:'caretaker@demo',phone:'0700000003',apts:['APT-001']},
+ {id:'USR-0005',name:'Jomo Kariuki',role:'collector',email:'collector@demo',phone:'0700000005',apts:['APT-001','APT-002']}
+];
+const APTS=[
+ {id:'APT-001',name:'Sunrise Apartments',hh:[{id:'CLT-001',unit:'A1',rate:300},{id:'CLT-002',unit:'A2',rate:300},{id:'CLT-003',unit:'B1',rate:250},{id:'CLT-004',unit:'B2',rate:250}]},
+ {id:'APT-002',name:'Mirema Heights',hh:[{id:'CLT-005',unit:'1',rate:200},{id:'CLT-006',unit:'2',rate:200},{id:'CLT-007',unit:'3',rate:250}]}
+];
+// ---- Storage ----
+const mem={};
+const ls={get(k,d){try{const v=localStorage.getItem(k);return v?JSON.parse(v):d}catch(e){return mem[k]??d}},set(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){mem[k]=v}},del(k){try{localStorage.removeItem(k)}catch(e){delete mem[k]}}};
+let U=null,pend=null,screen='',msg='',R=null;
+const $=i=>document.getElementById(i);
+const fmt=n=>Number(n).toLocaleString('en-KE');
+const when=s=>new Date(s).toLocaleString('en-KE',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});
+const recs=()=>ls.get('gp_records',[]);
+const mine=()=>recs().filter(r=>r.userId===U.id);
+const pending=()=>mine().filter(r=>!r.synced);
+const myApts=()=>allApts().filter(a=>U.role==='admin'||U.apts.includes(a.id)||a.owner===U.id);
+const newHhs=()=>ls.get('gp_newhh',[]);
+const allApts=()=>APTS.concat(ls.get('gp_newapts',[])).map(a=>({...a,hh:a.hh.concat(newHhs().filter(h=>h.aptId===a.id))}));
+const apt=id=>allApts().find(a=>a.id===id);
+const pendApts=()=>ls.get('gp_newapts',[]).filter(a=>!a.synced&&a.owner===U.id);
+const pendHh=()=>newHhs().filter(h=>!h.synced&&h.owner===U.id);
+const go=(s,m)=>{screen=s;msg=m||'';render()};
+const dev=()=>ls.get('gp_device',null);
+async function sha(s){try{const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s));return[...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('')}catch(e){return 'p'+s}}
+const b64=b=>btoa(String.fromCharCode(...new Uint8Array(b)));
+const unb64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+const chal=()=>crypto.getRandomValues(new Uint8Array(32));
+
+// ---- Sign in: same rules as the web app (code by email; admin also PIN). Phone then remembers you offline. ----
+function start(){
+ const v=$('who').value.trim().toLowerCase();
+ const u=USERS.find(x=>x.email===v||x.phone===v);
+ if(!u){msg='User not found';return render()}
+ if(u.role==='admin'&&$('pin1').value!==u.pin){msg='Wrong PIN';return render()}
+ pend=u;go('code','Code sent (demo code: '+DEMO_CODE+')');
+}
+function verify(){
+ if($('cd').value.trim()!==DEMO_CODE){msg='Wrong code';return render()}
+ U=pend;ls.set('gp_n_dummy',0);go(dev()&&dev().userId===U.id?'home':'enrol');
+}
+async function enrolBio(){
+ try{
+  const cred=await navigator.credentials.create({publicKey:{challenge:chal(),rp:{name:'G+'},user:{id:new TextEncoder().encode(U.id),name:U.email,displayName:U.name},pubKeyCredParams:[{type:'public-key',alg:-7},{type:'public-key',alg:-257}],authenticatorSelection:{authenticatorAttachment:'platform',userVerification:'required'},timeout:60000}});
+  ls.set('gp_device',{userId:U.id,credId:b64(cred.rawId)});go('home','Phone unlock is on')
+ }catch(e){msg='Fingerprint or face unlock is not available here. Use an app PIN.';render()}
+}
+async function enrolPin(){
+ const p=$('np').value;if(!/^\d{4,6}$/.test(p)){msg='Use 4 to 6 digits';return render()}
+ ls.set('gp_device',{userId:U.id,pinHash:await sha(p)});go('home','App PIN is on');
+}
+async function unlockBio(){
+ const d=dev();
+ try{await navigator.credentials.get({publicKey:{challenge:chal(),allowCredentials:[{type:'public-key',id:unb64(d.credId)}],userVerification:'required',timeout:60000}});U=USERS.find(x=>x.id===d.userId);go('home')}
+ catch(e){msg='Unlock failed. Try again or sign in again.';render()}
+}
+async function unlockPin(){
+ const d=dev();if(await sha($('up').value)===d.pinHash){U=USERS.find(x=>x.id===d.userId);go('home')}else{msg='Wrong PIN';render()}
+}
+function lock(){U=null;go('lock')}
+function forget(){ls.del('gp_device');U=null;go('login')}
+
+// ---- Payments ----
+function newForm(){const d=new Date();R={scope:'ind',apt:'',hh:'',method:'M-Pesa',month:d.toLocaleString('en-GB',{month:'long',year:'numeric'}),st:{},amt:'',ack:false}}
+function setR(k,v){R[k]=v;R.ack=false;if(k==='apt'){R.hh='';R.st={};(apt(v)?.hh||[]).forEach(h=>R.st[h.id]=h.status==='Vacant'?'Vacant':'Paid');R.amt=''}render()}
+function setSt(id,v){R.st[id]=v;R.amt='';R.ack=false;render()}
+function expBulk(){const a=apt(R.apt);return a?a.hh.filter(h=>R.st[h.id]==='Paid').reduce((s,h)=>s+h.rate,0):0}
+function save(){
+ const a=apt(R.apt);if(!a){msg='Choose an apartment';return render()}
+ let alloc,expected,amount;
+ if(R.scope==='ind'){const h=a.hh.find(x=>x.id===R.hh);if(!h){msg='Choose a household';return render()}
+  alloc=[{clientId:h.id,unit:h.unit,status:'Paid',amount:h.rate}];expected=amount=h.rate}
+ else{alloc=a.hh.map(h=>({clientId:h.id,unit:h.unit,status:R.st[h.id]||'Paid',amount:R.st[h.id]==='Paid'?h.rate:0}));
+  expected=expBulk();amount=R.amt===''?expected:Number(R.amt);
+  if(amount!==expected&&!R.ack){R.ack=true;msg='Amount received ('+fmt(amount)+') does not match the Paid households ('+fmt(expected)+'). Fix it or tap Save again.';return render()}}
+ const k='gp_n_'+U.id,n=ls.get(k,0)+1;ls.set(k,n);
+ const r={id:'PAY-'+U.id.slice(4)+'-'+String(n).padStart(4,'0'),recordedAt:new Date().toISOString(),userId:U.id,collector:U.name,scope:R.scope==='ind'?'Individual':'Whole apartment',aptId:a.id,aptName:a.name,method:R.method,month:R.month,expected,amount,allocations:alloc,synced:false,syncedAt:''};
+ const all=recs();all.push(r);ls.set('gp_records',all);newForm();go('home','Saved '+r.id+' at '+when(r.recordedAt));
+}
+async function sync(){
+ const p=pending(),pa=pendApts(),ph=pendHh();if(!p.length&&!pa.length&&!ph.length){msg='Nothing to sync';return render()}
+ if(!SYNC_URL){msg='Sync link not set yet. Records stay safe on this phone.';return render()}
+ try{const res=await fetch(SYNC_URL,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({user:U.id,records:p,apartments:pa,households:ph})});if(!res.ok)throw 0;
+  const ids=p.map(r=>r.id),now=new Date().toISOString();ls.set('gp_records',recs().map(r=>ids.includes(r.id)?{...r,synced:true,syncedAt:now}:r));ls.set('gp_newapts',ls.get('gp_newapts',[]).map(a=>pa.some(x=>x.id===a.id)?{...a,synced:true}:a));ls.set('gp_newhh',newHhs().map(h=>ph.some(x=>x.id===h.id)?{...h,synced:true}:h));msg='Synced '+(p.length+pa.length+ph.length)+' item(s)'}
+ catch(e){msg='No network. Try again later.'}render();
+}
+const DAYS=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],FLOORS=['Ground','1st','2nd','3rd','4th','5th','6th','7th','8th','9th','10th'],TYPES=['Bedsitter','Studio','1 bedroom','2 bedroom','3 bedroom','Other'];
+let N={},H={};
+const fld=(l,o,k,t)=>`<label>${l}</label><input type="${t||'text'}" value="${(o==='N'?N:H)[k]}" oninput="${o}.${k}=this.value">`;
+const sel=(l,o,k,opts)=>`<label>${l}</label><select onchange="${o}.${k}=this.value">${opts.map(x=>`<option ${(o==='N'?N:H)[k]===x?'selected':''}>${x}</option>`).join('')}</select>`;
+function newApt(){N={name:'',location:'',caretaker:'',caretakerPhone:'',caretakerPhone2:'',payerPhone:'',day:'Monday',start:''}}
+function newHh(aid){H={aptId:aid,unit:'',floor:'Ground',type:'1 bedroom',tenant:'',phone:'',bins:'1',rate:'',status:'Active',notes:''}}
+function saveApt(){
+ if(!N.name.trim()||!N.location.trim()){msg='Enter the apartment name and area';return render()}
+ const k='gp_na_'+U.id,n=ls.get(k,0)+1;ls.set(k,n);
+ const a={id:'APT-N'+U.id.slice(4)+'-'+String(n).padStart(3,'0'),name:N.name.trim(),location:N.location.trim(),caretaker:N.caretaker.trim(),caretakerPhone:N.caretakerPhone.trim(),caretakerPhone2:N.caretakerPhone2.trim(),payerPhone:N.payerPhone.trim(),day:N.day,start:N.start,hh:[],owner:U.id,isNew:true,createdAt:new Date().toISOString(),synced:false};
+ const l=ls.get('gp_newapts',[]);l.push(a);ls.set('gp_newapts',l);newHh(a.id);go('addhh','Saved apartment. Now add its households.');
+}
+function saveHh(more){
+ if(!H.unit.trim()||!Number(H.rate)){msg='Enter the house number and monthly rate';return render()}
+ const a=apt(H.aptId);if(a.hh.some(x=>String(x.unit).toLowerCase()===H.unit.trim().toLowerCase())){msg='That house number already exists in this apartment';return render()}
+ const k='gp_nh_'+U.id,n=ls.get(k,0)+1;ls.set(k,n);
+ const h={id:'CLT-N'+U.id.slice(4)+'-'+String(n).padStart(3,'0'),aptId:H.aptId,unit:H.unit.trim(),floor:H.floor,type:H.type,tenant:H.tenant.trim(),phone:H.phone.trim(),bins:Number(H.bins)||1,rate:Number(H.rate),status:H.status,notes:H.notes,owner:U.id,createdAt:new Date().toISOString(),synced:false};
+ const l=newHhs();l.push(h);ls.set('gp_newhh',l);
+ if(more){newHh(H.aptId);msg='Saved '+h.unit+'. Add the next one.';render()}else go('apts','Saved '+h.unit);
+}
+function csv(){const h='payment_id,recorded_at,user,scope,apartment,method,month,expected,amount,household,status,household_amount';
+ const l=[];mine().forEach(r=>r.allocations.forEach(a=>l.push([r.id,r.recordedAt,r.userId,r.scope,r.aptId,r.method,r.month,r.expected,r.amount,a.clientId,a.status,a.amount].join(','))));return[h].concat(l).join('\n')}
+
+const recCard=r=>`<div class="card"><div class="row"><b>KES ${fmt(r.amount)}</b><span class="pill">${r.synced?'Synced':'Waiting'}</span></div><div class="mu">${r.aptName} · ${r.scope} · ${r.method}</div><div class="mu">${when(r.recordedAt)} · ${r.id}${U.role==='admin'?' · '+r.collector:''}</div></div>`;
+
+function render(){
+ const m=msg?`<div class="${/^(Saved|Synced|Code sent|Phone|App)/.test(msg)?'ok':'err'}">${msg}</div>`:'';
+ const d=dev();let h='';
+ if(!screen)screen=d?'lock':'login';
+ if(screen==='login'){
+  h=`<h1><span class="logo">G+</span></h1><div class="mu">Sign in with your email or phone</div>
+  <label>Email or phone</label><input id="who" autocapitalize="none" placeholder="you@example.com">
+  <label>PIN (admin only)</label><input id="pin1" type="password" inputmode="numeric">
+  <button onclick="start()">Send me a code</button>${m}`;
+ }else if(screen==='code'){
+  h=`<h1><span class="logo">G+</span></h1><div class="mu">Enter the code sent to ${pend.email}</div>${m}
+  <label>One time code</label><input id="cd" inputmode="numeric"><button onclick="verify()">Continue</button><button class="ghost" onclick="go('login')">Back</button>`;
+ }else if(screen==='enrol'){
+  h=`<h1>Unlock on this phone</h1><div class="mu">So you can open G+ with no network.</div>${m}
+  <button onclick="enrolBio()">Use fingerprint, face or phone lock</button>
+  <label>Or set an app PIN</label><input id="np" type="password" inputmode="numeric" placeholder="4 to 6 digits"><button class="ghost" onclick="enrolPin()">Save app PIN</button>`;
+ }else if(screen==='lock'){
+  const u=USERS.find(x=>x.id===d.userId);
+  h=`<h1><span class="logo">G+</span></h1><div class="mu">Welcome back, ${u.name}</div>${m}`+
+  (d.credId?`<button onclick="unlockBio()">Unlock</button>`:`<label>App PIN</label><input id="up" type="password" inputmode="numeric"><button onclick="unlockPin()">Unlock</button>`)+
+  `<button class="ghost" onclick="forget()">Not you? Sign in again</button>`;
+ }else{
+  const top=`<div class="top"><div><span class="logo">G+</span> ${U.name} <span class="pill">${U.role}</span></div><button class="ghost" onclick="lock()">Lock</button></div>`;
+  if(screen==='home'){
+   h=top+`<h2>Home</h2>${m}<div class="card row"><span>Waiting to sync</span><b>${U.role==='caretaker'?'-':pending().length+pendApts().length+pendHh().length}</b></div>`;
+   if(U.role==='collector')h+=`<button onclick="newForm();go('rec')">Record payment</button><button class="ghost" onclick="go('list')">My records</button><button class="ghost" onclick="go('apts')">Apartments</button><button class="ghost" onclick="go('sync')">Sync</button>`;
+   else if(U.role==='caretaker')h+=`<button onclick="go('apts')">My apartments</button>`;
+   else if(U.role==='admin')h+=`<button onclick="go('list')">All records</button><button class="ghost" onclick="go('apts')">Apartments</button><button class="ghost" onclick="go('sync')">Sync</button>`;
+   else h+=`<div class="mu" style="margin-top:12px">Please use the main G+ web app.</div>`;
+  }else if(screen==='rec'){
+   const a=apt(R.apt);
+   h=top+`<h2>Record payment</h2><label>Payment scope</label><select onchange="setR('scope',this.value)"><option value="ind" ${R.scope==='ind'?'selected':''}>Individual household</option><option value="bulk" ${R.scope==='bulk'?'selected':''}>Whole apartment</option></select>
+   <label>Apartment</label><select onchange="setR('apt',this.value)"><option value="">Choose</option>${myApts().map(x=>`<option value="${x.id}" ${R.apt===x.id?'selected':''}>${x.name}</option>`).join('')}</select>`;
+   if(a&&R.scope==='ind'){h+=`<label>Household</label><select onchange="setR('hh',this.value)"><option value="">Choose</option>${a.hh.map(x=>`<option value="${x.id}" ${R.hh===x.id?'selected':''}>${x.unit} (KES ${x.rate})</option>`).join('')}</select>`;
+    const s=a.hh.find(x=>x.id===R.hh);if(s)h+=`<div class="card row"><span>Amount</span><b>KES ${fmt(s.rate)}</b></div>`}
+   if(a&&R.scope==='bulk'){h+=`<label>Households</label>`+a.hh.map(x=>`<div class="card row"><span>${x.unit} · KES ${x.rate}</span><select onchange="setSt('${x.id}',this.value)">${['Paid','Not paid','Vacant'].map(o=>`<option ${R.st[x.id]===o?'selected':''}>${o}</option>`).join('')}</select></div>`).join('')+
+    `<label>Amount received (KES)</label><input type="number" inputmode="numeric" value="${R.amt===''?expBulk():R.amt}" oninput="R.amt=this.value;R.ack=false">`}
+   h+=`<label>Method</label><select onchange="setR('method',this.value)"><option ${R.method==='M-Pesa'?'selected':''}>M-Pesa</option><option ${R.method==='Cash'?'selected':''}>Cash</option></select>
+   <label>Month covered</label><input value="${R.month}" onchange="R.month=this.value">${m}<button onclick="save()">${R.ack?'Save anyway':'Save'}</button><button class="ghost" onclick="go('home')">Cancel</button><p class="mu">The time is stamped automatically on save.</p>`;
+  }else if(screen==='list'){
+   const l=(U.role==='admin'?recs():mine()).slice().reverse();
+   h=top+`<h2>${U.role==='admin'?'All records':'My records'}</h2>`+(l.length?l.map(recCard).join(''):'<div class="mu">No records yet</div>')+`<button class="ghost" onclick="go('home')">Back</button>`;
+  }else if(screen==='apts'){
+   const mo=new Date().toLocaleString('en-GB',{month:'long',year:'numeric'});
+   h=top+`<h2>Apartments · ${mo}</h2>${m}`+(U.role!=='caretaker'?`<button onclick="newApt();go('addapt')">Add apartment</button>`:'')+myApts().map(a=>`<div class="card"><div class="row"><b>${a.name}</b>${a.isNew&&!a.synced?'<span class="pill">New</span>':''}</div><div class="mu">${a.location||''} · Caretaker ${a.caretaker||'-'} ${a.caretakerPhone||''}</div>${U.role!=='caretaker'?`<button class="ghost" onclick="newHh('${a.id}');go('addhh')">Add household</button>`:''}`+a.hh.map(x=>{const p=recs().some(r=>r.month===mo&&r.allocations.some(y=>y.clientId===x.id&&y.status==='Paid'));return`<div class="row mu"><span>${x.unit}${x.floor?' · '+x.floor:''} · KES ${x.rate}</span><span class="pill">${x.status==='Suspended'?'Suspended':x.status==='Vacant'?'Vacant':p?'Paid':'Waiting'}</span></div>`}).join('')+`</div>`).join('')+`<button class="ghost" onclick="go('home')">Back</button>`;
+  }else if(screen==='addapt'){
+   h=top+`<h2>Add apartment</h2>`+fld('Apartment or estate name','N','name')+fld('Area or location','N','location')+fld('Caretaker name','N','caretaker')+fld('Caretaker phone','N','caretakerPhone','tel')+fld('Caretaker phone 2 (optional)','N','caretakerPhone2','tel')+fld('Landlord or payer M-Pesa phone (for whole apartment payments)','N','payerPhone','tel')+sel('Collection day','N','day',DAYS)+fld('Service start date','N','start','date')+m+`<button onclick="saveApt()">Save and add households</button><button class="ghost" onclick="go('apts')">Cancel</button>`;
+  }else if(screen==='addhh'){
+   const a=apt(H.aptId);
+   h=top+`<h2>Add household</h2><div class="mu">${a.name}</div>`+fld('House or unit number','H','unit')+sel('Floor','H','floor',FLOORS)+sel('Unit type','H','type',TYPES)+fld('Tenant name','H','tenant')+fld('Tenant phone','H','phone','tel')+fld('Number of bins','H','bins','number')+fld('Monthly rate (KES)','H','rate','number')+sel('Status','H','status',['Active','Suspended','Vacant'])+fld('Notes','H','notes')+m+`<button onclick="saveHh(true)">Save and add another</button><button class="ghost" onclick="saveHh(false)">Save and finish</button><button class="ghost" onclick="go('apts')">Cancel</button>`;
+  }else if(screen==='sync'){
+   h=top+`<h2>Sync</h2><div class="card row"><span>Waiting to sync</span><b>${pending().length}</b></div>${m}<button onclick="sync()">Sync now</button><label>Backup (copy this if needed)</label><textarea readonly>${csv()}</textarea><button class="ghost" onclick="go('home')">Back</button>`;
+  }
+ }
+ $('app').innerHTML=h;
+}
+render();
+</script><script>if('serviceWorker' in navigator){window.addEventListener('load',function(){navigator.serviceWorker.register('sw.js').catch(function(){})})}</script></body></html>
